@@ -1,0 +1,9 @@
+httpx
+fastapi
+uvicorn[standard]
+pydantic
+sqlalchemy
+aiosqlite
+sqlmodel
+playwright
+nats-py

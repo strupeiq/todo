@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>Cors_Test</title>
+    </head>
+    <body>
+    <button id="btn">GET TASK</button>
+    <script>
+        document.getElementById("btn").addEventListener(
+            "click", async() => {
+                fetch('http://127.0.0.1:8000/add?a=1&b=2', {
+                    headers: {
+                        'accept': 'application/json'
+                    }
+                });
+            }
+        );
+    </script>
+    </body>
+</html>
