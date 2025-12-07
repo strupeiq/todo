@@ -7,10 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import json
+from nats.aio.client import Client as NATSClient
+import nats
 
-from sqlalchemy import Column, Integer, String, Boolean, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base
 from sqlmodel import SQLModel, Field
 from playwright.async_api import async_playwright
 
@@ -21,6 +23,7 @@ engine = create_async_engine(
 DBSession = async_sessionmaker(bind=engine, autoflush=False,
                          autocommit=False,
                          class_=AsyncSession)
+NATSClientType = NATSClient
 
 
 class ConnectionManager:
@@ -47,8 +50,52 @@ class ConnectionManager:
         for ws in self.active_connetcion:
             await ws.send_text(data)
 
+    async def broadcast_json(self, data: dict):
+        await self.broadcast(json.dumps(data))
+
 
 manager = ConnectionManager()
+
+
+class TaskEvent(BaseModel):
+    event_type: str
+    task_id: int | None = Field(primary_key=True)
+    task_title: str
+    timestamp: float
+
+
+class NatsManager:
+    def __init__(self):
+        self.nc: NATSClient | None = None
+
+    async def connect(self):
+        try:
+            self.nc = await nats.connect("nats://localhost:4222")
+            print("Подключение к NATS установлено")
+            await self.nc.subscribe("task_events", cb=self.handle_nats_message)
+
+        except Exception as e:
+            print(f"Ошибка подключения к NATS: {e}")
+            self.nc = None
+
+    async def publish_task_event(self, event: TaskEvent):
+        if self.nc:
+            try:
+                event_data = json.dumps(event.dict())
+                await self.nc.publish("task_events", event_data.encode())
+                print(f"Событие отправлено в NATS: {event.event_type} task {event.task_id}")
+            except Exception as e:
+                print(f"Ошибка отправки в NATS: {e}")
+
+    async def handle_nats_message(self, msg):
+        try:
+            data = msg.data.decode()
+            await manager.broadcast(data)
+        except Exception as e:
+            print(f"Ошибка обработки сообщения NATS: {e}")
+
+
+nats_manager = NatsManager()
 
 
 class TaskModel(SQLModel, table=True):
@@ -75,27 +122,11 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def on_startup():
-    import nats
     async with engine.begin() as conn:
         await conn.run_sync(
             SQLModel.metadata.create_all
         )
-    nc = await nats.connect("nats://localhost:4222")
-    data = {
-        "foo": 1,
-        "name": "test"
-    }
-    await nc.publish("test", b"abc123")
-    await nc.publish("test", json.dumps(data).encode())
-
-    async def message_handler(msg):
-        data = msg.data.decode()
-        print(f"NATS msg: {data}")
-        await manager.broadcast(data)
-
-    await nc.subscribe("test", cb=message_handler)
-
-    await nc.publish("test", b"Hello!")
+    await nats_manager.connect()
 
 
 app.add_middleware(
@@ -115,6 +146,33 @@ async def log_requwsts(request: Request, call_next):
     print(
         f"Request to {request.url.path} processed in {process_time:.4f} seconds")
     return response
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+
+    async def tick():
+        while True:
+            websocket.send_text("FOO!")
+            await asyncio.sleep(1)
+    asyncio.current_task(tick())
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await manager.handle(data, websocket)
+    except WebSocketDisconnect:
+        await manager.disconnect(websocket)
+
+
+async def send_task_event(event_type: str, task: TaskModel):
+    event = TaskEvent(
+        event_type=event_type,
+        task_id=task.id,
+        task_title=task.title,
+        timestamp=time.time()
+    )
+    await nats_manager.publish_task_event(event)
 
 
 @app.get("/add")
@@ -176,6 +234,9 @@ async def create_task(task: TaskCreate, db: AsyncSession = Depends(get_db)):
     db.add(new_task)
     await db.commit()
     await db.refresh(new_task)
+
+    await send_task_event("created", new_task)
+
     return new_task
 
 
@@ -190,11 +251,18 @@ async def update_task(task_id: int, updated: TaskUpdate, db: AsyncSession = Depe
             status_code=404,
             detail="Task not found"
         )
+
+    old_title = task.title
+    old_description = task.description
+
     task.title = updated.title
     task.description = updated.description
     task.done = updated.done
     await db.commit()
     await db.refresh(task)
+
+    await send_task_event("updated", task)
+
     return task
 
 
@@ -203,8 +271,19 @@ async def delete_task(task_id: int, db: AsyncSession = Depends(get_db)):
     obj = await db.get(TaskModel, task_id)
     if not obj:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    task_data = {"id": obj.id, "title": obj.title}
+
     await db.delete(obj)
     await db.commit()
+
+    event = TaskEvent(
+        event_type="deleted",
+        task_id=task_data["id"],
+        task_title=task_data["title"],
+        timestamp=time.time()
+    )
+    await nats_manager.publish_task_event(event)
 
 
 @app.get("/async_task")
@@ -331,20 +410,3 @@ async def parser(background_task: BackgroundTasks):
     return {
         "message": "Парсер запущен в фоне"
     }
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-
-    async def tick():
-        while True:
-            websocket.send_text("FOO!")
-            await asyncio.sleep(1)
-    asyncio.current_task(tick())
-    try:
-        while True:
-            data = await websocket.receive_text()
-            await manager.handle(data, websocket)
-    except WebSocketDisconnect:
-        await manager.disconnect(websocket)
